@@ -51,6 +51,8 @@ class SinePositionalEmbedding(nn.Module):
 
     def extend_pe(self, x):
         position = torch.cumsum(torch.ones_like(x[:,:,0]), dim=1).transpose(0, 1)
+        if self.div_term.device != x.device:
+            self.div_term = self.div_term.to(dtype=x.dtype, device=x.device)
         scpe = (position * self.div_term).unsqueeze(0)
         pe = torch.cat([torch.sin(scpe), torch.cos(scpe)]).permute(1, 2, 0)
         pe = pe.contiguous().view(1, -1, self.embedding_dim)

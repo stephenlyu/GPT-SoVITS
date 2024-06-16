@@ -34,6 +34,7 @@ def logits_to_probs(
     top_p = None,
     repetition_penalty: float = 1.0,
 ):
+    global inf_tensor_value
     previous_tokens = previous_tokens.squeeze()
     if previous_tokens is not None and repetition_penalty != 1.0:
         previous_tokens = previous_tokens.long()
@@ -60,6 +61,8 @@ def logits_to_probs(
     if top_k is not None:
         v, _ = torch.topk(logits, top_k)
         pivot = v.select(-1, -1).unsqueeze(-1)
+        if inf_tensor_value.device != logits.device:
+            inf_tensor_value = inf_tensor_value.to(device=logits.device)
         logits = torch.where(logits < pivot, inf_tensor_value, logits)
 
     probs = torch.nn.functional.softmax(logits, dim=-1)
@@ -125,7 +128,7 @@ class T2SFirstStageDecoder(nn.Module):
             "stage": 0,
         }
 
-        y_emb = self.ar_audio_embedding(y)
+        y_emb = self.ar_audio_embedding(y)        
 
         cache["y_emb"] = y_emb
         y_pos = self.ar_audio_position(y_emb)
@@ -145,10 +148,10 @@ class T2SFirstStageDecoder(nn.Module):
         x_attn_mask_pad = torch.cat([x_attn_mask, torch.ones_like(x_y_pad)], dim=1)
         y_attn_mask = torch.cat([y_x_pad, y_attn_mask], dim=1)
         xy_attn_mask = torch.concat([x_attn_mask_pad, y_attn_mask], dim=0)
-        cache["k"] = torch.matmul(x_attn_mask_pad[0].float().unsqueeze(-1), torch.zeros((1, 512)))\
-        .unsqueeze(1).repeat(self.num_layers, 1, 1, 1)
-        cache["v"] = torch.matmul(x_attn_mask_pad[0].float().unsqueeze(-1), torch.zeros((1, 512)))\
-        .unsqueeze(1).repeat(self.num_layers, 1, 1, 1)
+        cache["k"] = torch.matmul(x_attn_mask_pad[0].float().unsqueeze(-1), torch.zeros((1, 512)).to(device=x_attn_mask_pad.device))\
+        .unsqueeze(1).repeat(self.num_layers, 1, 1, 1).to(xy_pos.dtype)
+        cache["v"] = torch.matmul(x_attn_mask_pad[0].float().unsqueeze(-1), torch.zeros((1, 512)).to(device=x_attn_mask_pad.device))\
+        .unsqueeze(1).repeat(self.num_layers, 1, 1, 1).to(xy_pos.dtype)
 
         xy_dec = self.h(xy_pos, mask=xy_attn_mask, cache=cache)
         logits = self.ar_predict_layer(xy_dec[:, -1])
@@ -262,12 +265,12 @@ class Text2SemanticDecoder(nn.Module):
         prefix_len = prompts.shape[1]
 
         x = self.onnx_encoder(x, bert_feature)
-        y, k, v, y_emb, stage, x_example = self.first_stage_decoder(x, prompts)
+        y, k, v, y_emb, x_example = self.first_stage_decoder(x, prompts)
 
         stop = False
         for idx in range(1, 1500):
-            enco = self.stage_decoder(y, k, v, y_emb, stage, x_example)
-            y, k, v, y_emb, stage, logits, samples = enco
+            enco = self.stage_decoder(y, k, v, y_emb, x_example)
+            y, k, v, y_emb, logits, samples = enco
             if early_stop_num != -1 and (y.shape[1] - prefix_len) > early_stop_num:
                 stop = True
             if torch.argmax(logits, dim=-1)[0] == self.EOS or samples[0, 0] == self.EOS:
@@ -276,6 +279,21 @@ class Text2SemanticDecoder(nn.Module):
                 break
         y[0, -1] = 0
         return y, idx
+
+    def infer_panel(
+        self,
+        x,  #####全部文本token
+        x_lens,
+        prompts,  ####参考音频token
+        bert_feature,
+        top_k: int = -100,
+        top_p: int = 100,
+        early_stop_num: int = -1,
+        temperature: float = 1.0,
+    ):
+        self.top_k[0] = top_k
+        self.early_stop_num[0] = early_stop_num
+        return self.forward(x, prompts, bert_feature)
 
     def infer(self, x, prompts, bert_feature):
         top_k = self.top_k

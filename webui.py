@@ -174,9 +174,10 @@ def change_uvr5(if_uvr5):
         p_uvr5=None
         yield i18n("UVR5已关闭")
 
-def change_tts_inference(if_tts,bert_path,cnhubert_base_path,gpu_number,gpt_path,sovits_path):
+def change_tts_inference(if_tts,bert_path,cnhubert_base_path,gpu_number,gpt_path,sovits_path,is_onnx=False):
     global p_tts_inference
     if(if_tts==True and p_tts_inference==None):
+        os.environ['onnx'] = str(is_onnx)
         os.environ["gpt_path"]=gpt_path if "/" in gpt_path else "%s/%s"%(GPT_weight_root,gpt_path)
         os.environ["sovits_path"]=sovits_path if "/"in sovits_path else "%s/%s"%(SoVITS_weight_root,sovits_path)
         os.environ["cnhubert_base_path"]=cnhubert_base_path
@@ -869,8 +870,9 @@ with gr.Blocks(title="GPT-SoVITS WebUI") as app:
                     refresh_button.click(fn=change_choices,inputs=[],outputs=[SoVITS_dropdown,GPT_dropdown])
                 with gr.Row():
                     if_tts = gr.Checkbox(label=i18n("是否开启TTS推理WebUI"), show_label=True)
+                    if_onnx = gr.Checkbox(label=i18n("是否使用onnx"), show_label=True)
                     tts_info = gr.Textbox(label=i18n("TTS推理WebUI进程输出信息"))
-                    if_tts.change(change_tts_inference, [if_tts,bert_pretrained_dir,cnhubert_base_dir,gpu_number_1C,GPT_dropdown,SoVITS_dropdown], [tts_info])
+                    if_tts.change(change_tts_inference, [if_tts,bert_pretrained_dir,cnhubert_base_dir,gpu_number_1C,GPT_dropdown,SoVITS_dropdown, if_onnx], [tts_info])
         with gr.TabItem(i18n("2-GPT-SoVITS-变声")):gr.Markdown(value=i18n("施工中，请静候佳音"))
     app.queue(concurrency_count=511, max_size=1022).launch(
         server_name="0.0.0.0",
