@@ -33,6 +33,10 @@ if os.path.exists("./sweight.txt"):
         sovits_path = os.environ.get("sovits_path", sweight_data)
 else:
     sovits_path = os.environ.get("sovits_path", "GPT_SoVITS/pretrained_models/s2G488k.pth")
+
+print('gpt_path:', gpt_path)
+print('sovits_path:', sovits_path)
+
 # gpt_path = os.environ.get(
 #     "gpt_path", "pretrained_models/s1bert25hz-2kh-longer-epoch=68e-step=50232.ckpt"
 # )
@@ -48,6 +52,11 @@ is_share = eval(is_share)
 if "_CUDA_VISIBLE_DEVICES" in os.environ:
     os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["_CUDA_VISIBLE_DEVICES"]
 is_half = eval(os.environ.get("is_half", "True")) and torch.cuda.is_available()
+is_onnx = eval(os.environ.get("onnx", "False"))
+is_ort = eval(os.environ.get("ort", "False"))
+print('is_half:', is_half)
+print('is_onnx:', is_onnx)
+print('is_ort:', is_ort)
 import gradio as gr
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 import numpy as np
@@ -56,14 +65,14 @@ from feature_extractor import cnhubert
 
 cnhubert.cnhubert_base_path = cnhubert_base_path
 
-is_onnx = eval(os.environ.get('onnx', 'False'))
-
 from module.models import SynthesizerTrn
 if is_onnx:
-    from AR.models.t2s_lightning_module_onnx import Text2SemanticLightningModule
+    if is_ort:
+        from onnx_rt.t2s_model import T2SModelOnnxRT
+    else:
+        from AR.models.t2s_lightning_module_onnx import Text2SemanticLightningModule
 else:
     from AR.models.t2s_lightning_module import Text2SemanticLightningModule
-
 from text import cleaned_text_to_sequence
 from text.cleaner import clean_text
 from time import time as ttime
@@ -165,27 +174,34 @@ def change_sovits_weights(sovits_path):
 
 change_sovits_weights(sovits_path)
 
-
-def change_gpt_weights(gpt_path):
-    global hz, max_sec, t2s_model, config
+if is_onnx and is_ort:
+    if is_half:
+        t2s_model = T2SModelOnnxRT('GPT_SoVITS/onnx_f16/test')
+    else:
+        t2s_model = T2SModelOnnxRT('GPT_SoVITS/onnx/test', is_half=False)
     hz = 50
-    dict_s1 = torch.load(gpt_path, map_location="cpu")
-    config = dict_s1["config"]
-    max_sec = config["data"]["max_sec"]
-    t2s_model = Text2SemanticLightningModule(config, "****", is_train=False)
-    t2s_model.load_state_dict(dict_s1["weight"])
-    if is_half == True:
-        t2s_model = t2s_model.half()
-    t2s_model = t2s_model.to(device)
-    t2s_model.eval()
-    if is_onnx:
-        t2s_model.model.init_onnx()
-    total = sum([param.nelement() for param in t2s_model.parameters()])
-    print("Number of parameter: %.2fM" % (total / 1e6))
-    with open("./gweight.txt", "w", encoding="utf-8") as f: f.write(gpt_path)
+    max_sec = 54
+else:
+    def change_gpt_weights(gpt_path):
+        global hz, max_sec, t2s_model, config
+        hz = 50
+        dict_s1 = torch.load(gpt_path, map_location="cpu")
+        config = dict_s1["config"]
+        max_sec = config["data"]["max_sec"]
+        t2s_model = Text2SemanticLightningModule(config, "****", is_train=False)
+        t2s_model.load_state_dict(dict_s1["weight"])
+        if is_half == True:
+            t2s_model = t2s_model.half()
+        t2s_model = t2s_model.to(device)
+        t2s_model.eval()
+        if is_onnx:
+            t2s_model.model.init_onnx()    
+        total = sum([param.nelement() for param in t2s_model.parameters()])
+        print("Number of parameter: %.2fM" % (total / 1e6))
+        with open("./gweight.txt", "w", encoding="utf-8") as f: f.write(gpt_path)
+        t2s_model = t2s_model.model
 
-
-change_gpt_weights(gpt_path)
+    change_gpt_weights(gpt_path)
 
 
 def get_spepc(hps, filename):
@@ -354,7 +370,6 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
             1, 2
         )  # .float()
         codes = vq_model.extract_latent(ssl_content)
-   
         prompt_semantic = codes[0, 0]
     t1 = ttime()
 
@@ -396,12 +411,10 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
         all_phoneme_len = torch.tensor([all_phoneme_ids.shape[-1]]).to(device)
         prompt = prompt_semantic.unsqueeze(0).to(device)
         t2 = ttime()
-        with torch.no_grad():
-            # pred_semantic = t2s_model.model.infer(
-            pred_semantic, idx = t2s_model.model.infer_panel(
+        if is_onnx and is_ort:                        
+            pred_semantic, idx = t2s_model.infer_panel(
                 all_phoneme_ids,
-                all_phoneme_len,
-                None if ref_free else prompt,
+                prompt,
                 bert,
                 # prompt_phone_len=ph_offset,
                 top_k=top_k,
@@ -409,6 +422,20 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
                 temperature=temperature,
                 early_stop_num=hz * max_sec,
             )
+        else:
+            with torch.no_grad():
+                # pred_semantic = t2s_model.model.infer(
+                pred_semantic, idx = t2s_model.infer_panel(
+                    all_phoneme_ids,
+                    all_phoneme_len,
+                    None if ref_free else prompt,
+                    bert,
+                    # prompt_phone_len=ph_offset,
+                    top_k=top_k,
+                    top_p=top_p,
+                    temperature=temperature,
+                    early_stop_num=hz * max_sec,
+                )
         t3 = ttime()
         # print(pred_semantic.shape,idx)
         pred_semantic = pred_semantic[:, -idx:].unsqueeze(
@@ -437,6 +464,7 @@ def get_tts_wav(ref_wav_path, prompt_text, prompt_language, text, text_language,
     return hps.data.sampling_rate, (np.concatenate(audio_opt, 0) * 32768).astype(
         np.int16
     )
+
 
 def split(todo_text):
     todo_text = todo_text.replace("……", "。").replace("——", "，")

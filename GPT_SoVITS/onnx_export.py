@@ -80,7 +80,7 @@ class T2SEncoder(nn.Module):
         all_phoneme_ids = torch.cat([ref_seq, text_seq], 1)
         bert = bert.unsqueeze(0)
         prompt = prompt_semantic.unsqueeze(0)
-        return self.encoder(all_phoneme_ids, bert), prompt
+        return all_phoneme_ids, bert, prompt
 
 
 class T2SModel(nn.Module):
@@ -107,7 +107,8 @@ class T2SModel(nn.Module):
         early_stop_num = self.t2s_model.early_stop_num
 
         #[1,N] [1,N] [N, 1024] [N, 1024] [1, 768, N]
-        x, prompts = self.onnx_encoder(ref_seq, text_seq, ref_bert, text_bert, ssl_content)
+        all_phoneme_ids, bert, prompts = self.onnx_encoder(ref_seq, text_seq, ref_bert, text_bert, ssl_content)
+        x = self.onnx_encoder.encoder(all_phoneme_ids, bert)
 
         prefix_len = prompts.shape[1]
 
@@ -141,22 +142,22 @@ class T2SModel(nn.Module):
             onnx_encoder_export_output.save(f"onnx/{project_name}/{project_name}_t2s_encoder.onnx")
             return
 
+        all_phoneme_ids, bert, prompts = self.onnx_encoder(ref_seq, text_seq, ref_bert, text_bert, ssl_content)
+        print(prompts)
+
         torch.onnx.export(
-            self.onnx_encoder,
-            (ref_seq, text_seq, ref_bert, text_bert, ssl_content),
+            self.onnx_encoder.encoder,
+            (all_phoneme_ids, bert),
             f"onnx/{project_name}/{project_name}_t2s_encoder.onnx",
-            input_names=["ref_seq", "text_seq", "ref_bert", "text_bert", "ssl_content"],
-            output_names=["x", "prompts"],
+            input_names=["all_phoneme_ids", "bert"],
+            output_names=["x"],
             dynamic_axes={
-                "ref_seq": {1 : "ref_length"},
-                "text_seq": {1 : "text_length"},
-                "ref_bert": {0 : "ref_length"},
-                "text_bert": {0 : "text_length"},
-                "ssl_content": {2 : "ssl_length"},
+                "all_phoneme_ids": {1 : "ref_length"},
+                "bert": {2 : "bert_length"},
             },
             opset_version=16
         )
-        x, prompts = self.onnx_encoder(ref_seq, text_seq, ref_bert, text_bert, ssl_content)
+        x = self.onnx_encoder.encoder(all_phoneme_ids, bert)
 
         torch.onnx.export(
             self.first_stage_decoder,
@@ -241,21 +242,21 @@ class GptSoVits(nn.Module):
 
     def export(self, ref_seq, text_seq, ref_bert, text_bert, ref_audio, ssl_content, project_name):
         self.t2s.export(ref_seq, text_seq, ref_bert, text_bert, ssl_content, project_name)
-        pred_semantic = self.t2s(ref_seq, text_seq, ref_bert, text_bert, ssl_content)
-        torch.onnx.export(
-            self.vits,
-            (text_seq, pred_semantic, ref_audio),
-            f"onnx/{project_name}/{project_name}_vits.onnx",
-            input_names=["text_seq", "pred_semantic", "ref_audio"],
-            output_names=["audio"],
-            dynamic_axes={
-                "text_seq": {1 : "text_length"},
-                "pred_semantic": {2 : "pred_length"},
-                "ref_audio": {1 : "audio_length"},
-            },
-            opset_version=17,
-            verbose=False
-        )
+        # pred_semantic = self.t2s(ref_seq, text_seq, ref_bert, text_bert, ssl_content)
+        # torch.onnx.export(
+        #     self.vits,
+        #     (text_seq, pred_semantic, ref_audio),
+        #     f"onnx/{project_name}/{project_name}_vits.onnx",
+        #     input_names=["text_seq", "pred_semantic", "ref_audio"],
+        #     output_names=["audio"],
+        #     dynamic_axes={
+        #         "text_seq": {1 : "text_length"},
+        #         "pred_semantic": {2 : "pred_length"},
+        #         "ref_audio": {1 : "audio_length"},
+        #     },
+        #     opset_version=17,
+        #     verbose=False
+        # )
 
 
 class SSLModel(nn.Module):
@@ -326,9 +327,9 @@ if __name__ == "__main__":
     except:
         pass
 
-    gpt_path = "GPT_weights/nahida-e25.ckpt"
-    vits_path = "SoVITS_weights/nahida_e30_s3930.pth"
-    exp_path = "nahida"
+    gpt_path = "../GPT_weights/test-e15.ckpt"
+    vits_path = "../SoVITS_weights/test_e8_s64.pth"
+    exp_path = "test"
     export(vits_path, gpt_path, exp_path)
 
-    # soundfile.write("out.wav", a, vits.hps.data.sampling_rate)
+    # soundfile.write("out.wav", a, vits.hps.data.sampling_rate
