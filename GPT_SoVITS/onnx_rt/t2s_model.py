@@ -19,13 +19,15 @@ class T2SModelOnnxRT:
         if prefix is None:
             prefix = os.path.basename(self.onnx_root)
         sess_opt = ort.SessionOptions()
-        # sess_opt.log_severity_level = 0
+        sess_opt.log_severity_level = 1
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        # providers = ['TensorrtExecutionProvider', 'CPUExecutionProvider']
         self.encoder = ort.InferenceSession(os.path.join(self.onnx_root, '%s_t2s_encoder.onnx' % prefix), 
-                                            sess_opt, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+                                            sess_opt, providers=providers)
         self.fsdec = ort.InferenceSession(os.path.join(self.onnx_root, '%s_t2s_fsdec.onnx' % prefix), 
-                                          sess_opt, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+                                          sess_opt, providers=providers)
         self.sdec = ort.InferenceSession(os.path.join(self.onnx_root, '%s_t2s_sdec.onnx' % prefix), 
-                                         sess_opt, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+                                         sess_opt, providers=providers)
 
     def encode(self, all_phoneme_ids, bert):
         binding = self.encoder.io_binding()
@@ -69,18 +71,15 @@ class T2SModelOnnxRT:
         binding.bind_output('k')        
         binding.bind_output('v')        
         binding.bind_output('y_emb')        
-        binding.bind_output('x_example')        
         self.fsdec.run_with_iobinding(binding)
 
         y = binding.get_outputs()[0]
         k = binding.get_outputs()[1]
         v = binding.get_outputs()[2]
         y_emb = binding.get_outputs()[3]
-        x_example = binding.get_outputs()[4]
-        return y, k, v, y_emb, x_example
+        return y, k, v, y_emb
 
-    def stage_decode(self, y, k, v, y_emb, x_example):
-        print('stage_decode')
+    def stage_decode(self, y, k, v, y_emb):
         binding = self.sdec.io_binding()
 
         binding.bind_input(name='iy', 
@@ -111,12 +110,6 @@ class T2SModelOnnxRT:
                            shape=y_emb.shape(), 
                            buffer_ptr=y_emb.data_ptr())
 
-        binding.bind_input(name='ix_example', 
-                           device_type=x_example.device_name(), 
-                           device_id=0, 
-                           element_type=np.float16 if self.is_half else np.float32, 
-                           shape=x_example.shape(), 
-                           buffer_ptr=x_example.data_ptr())
         binding.bind_output('y')
         binding.bind_output('k')        
         binding.bind_output('v')        
@@ -143,6 +136,7 @@ class T2SModelOnnxRT:
         early_stop_num: int = -1,
         temperature: float = 1.0,
     ):
+        print('t2s_model_onnx_rt.infer_panel')
         if not self.is_half:
             if bert_feature.dtype == torch.float16:
                 bert_feature = bert_feature.type(torch.float32)
@@ -154,13 +148,13 @@ class T2SModelOnnxRT:
         np.savetxt('TEMP/onnx-ort-x.txt', x.numpy().squeeze())
         np.savetxt('TEMP/onnx-ort-prompts.txt', prompts.cpu().numpy().squeeze())
 
-        y, k, v, y_emb, x_example = self.first_stage_decode(x, prompts)
+        y, k, v, y_emb = self.first_stage_decode(x, prompts)
 
         times = []
         stop = False
         for idx in range(1, 1500):
             start = time.time()
-            enco = self.stage_decode(y, k, v, y_emb, x_example)
+            enco = self.stage_decode(y, k, v, y_emb)
             times.append(time.time() - start)
             y, k, v, y_emb, logits, samples = enco
             if early_stop_num != -1 and (y.shape()[1] - prefix_len) > early_stop_num:

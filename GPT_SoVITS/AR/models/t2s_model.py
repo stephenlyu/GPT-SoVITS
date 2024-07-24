@@ -24,6 +24,8 @@ from torch import nn
 from torch.nn import functional as F
 from torchmetrics.classification import MulticlassAccuracy
 
+debug = True
+
 default_config = {
     "embedding_dim": 512,
     "hidden_dim": 512,
@@ -499,12 +501,22 @@ class Text2SemanticDecoder(nn.Module):
         early_stop_num: int = -1,
         temperature: float = 1.0,
     ):
+        if debug:
+            print('x1:', x.shape, x.dtype)
         x = self.ar_text_embedding(x)
+        if debug:
+            print('x2:', x.shape, x.dtype)
         x = x + self.bert_proj(bert_feature.transpose(1, 2))
+        if debug:
+            print('x3:', x.shape, x.dtype)
         x = self.ar_text_position(x)
+        if debug:
+            print('x4:', x.shape, x.dtype)
 
         # AR Decoder
         y = prompts
+        if debug:
+            print('y:', y.shape, y.dtype)
         
         x_len = x.shape[1]
         x_attn_mask = torch.zeros((x_len, x_len), dtype=torch.bool)
@@ -543,8 +555,10 @@ class Text2SemanticDecoder(nn.Module):
         xy_attn_mask = torch.concat([x_attn_mask_pad, y_attn_mask], dim=0).to(
             x.device
         )
-
+        import time
+        times = []
         for idx in tqdm(range(1500)):
+            start = time.time()
             if xy_attn_mask is not None:
                 xy_dec, k_cache, v_cache = self.t2s_transformer.process_prompt(xy_pos, xy_attn_mask)
             else:
@@ -553,6 +567,12 @@ class Text2SemanticDecoder(nn.Module):
             logits = self.ar_predict_layer(
                 xy_dec[:, -1]
             )
+            if debug:
+                print('xy_pos:', xy_pos.shape)
+                if xy_attn_mask is not None:
+                    print('xy_attn_mask:', xy_attn_mask.shape)
+                print('xy_dec:', xy_dec.shape)
+                print('logits:', logits.shape)
 
             if idx == 0:
                 xy_attn_mask = None
@@ -560,7 +580,8 @@ class Text2SemanticDecoder(nn.Module):
             samples = sample(
                 logits[0], y, top_k=top_k, top_p=top_p, repetition_penalty=1.35, temperature=temperature
             )[0].unsqueeze(0)
-
+            if debug:
+                print('samples:', samples.shape)
             y = torch.concat([y, samples], dim=1)
 
             if early_stop_num != -1 and (y.shape[1] - prefix_len) > early_stop_num:
@@ -577,9 +598,12 @@ class Text2SemanticDecoder(nn.Module):
                 break
 
             ####################### update next step ###################################
+            if debug:
+                print('y[:, -1:]:', y[:, -1:].shape)
             y_emb = self.ar_audio_embedding(y[:, -1:])
             xy_pos = y_emb * self.ar_audio_position.x_scale + self.ar_audio_position.alpha * self.ar_audio_position.pe[:, prompts.shape[1] + idx]
-
+            times.append(time.time() - start)
+        print(times)
         if ref_free:
             return y[:, :-1], 0
         return y[:, :-1], idx - 1

@@ -1,5 +1,6 @@
 # modified from https://github.com/yangdongchao/SoundStorm/blob/master/soundstorm/s1/AR/models/t2s_model.py
 # reference: https://github.com/lifeiteng/vall-e
+from typing import List
 import torch
 from tqdm import tqdm
 
@@ -23,6 +24,7 @@ default_config = {
     "phoneme_vocab_size": 512,
     "EOS": 1024,
 }
+debug = False
 
 inf_tensor_value = torch.FloatTensor([-float("Inf")]).float()
 
@@ -35,37 +37,38 @@ def logits_to_probs(
     repetition_penalty: float = 1.0,
 ):
     global inf_tensor_value
-    previous_tokens = previous_tokens.squeeze()
-    if previous_tokens is not None and repetition_penalty != 1.0:
-        previous_tokens = previous_tokens.long()
-        score = torch.gather(logits, dim=0, index=previous_tokens)
-        score = torch.where(
-            score < 0, score * repetition_penalty, score / repetition_penalty
-        )
-        logits.scatter_(dim=0, index=previous_tokens, src=score)
+    previous_tokens = previous_tokens.squeeze(0)
+    # if previous_tokens is not None and repetition_penalty != 1.0:
+    previous_tokens = previous_tokens.long()
+    score = torch.gather(logits, dim=0, index=previous_tokens)
+    score = torch.where(
+        score < 0, score * repetition_penalty, score / repetition_penalty
+    )
+    logits.scatter_(dim=0, index=previous_tokens, src=score)
 
-    if top_p is not None and top_p < 1.0:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cum_probs = torch.cumsum(
-            torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1
-        )
-        sorted_indices_to_remove = cum_probs > top_p
-        sorted_indices_to_remove[0] = False  # keep at least one option
-        indices_to_remove = sorted_indices_to_remove.scatter(
-            dim=0, index=sorted_indices, src=sorted_indices_to_remove
-        )
-        logits = logits.masked_fill(indices_to_remove, -float("Inf"))
+    # if top_p is not None and top_p < 1.0:
+    #     sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+    #     print('sorted_logits:', sorted_logits.shape)
+    #     cum_probs = torch.cumsum(
+    #         torch.nn.functional.softmax(sorted_logits, dim=-1), dim=-1
+    #     )
+    #     sorted_indices_to_remove = cum_probs > top_p
+    #     sorted_indices_to_remove[0] = False  # keep at least one option
+    #     indices_to_remove = sorted_indices_to_remove.scatter(
+    #         dim=0, index=sorted_indices, src=sorted_indices_to_remove
+    #     )
+    #     logits = logits.masked_fill(indices_to_remove, -float("Inf"))
 
     logits = logits / max(temperature, 1e-5)
 
-    if top_k is not None:
-        v, _ = torch.topk(logits, top_k)
-        pivot = v.select(-1, -1).unsqueeze(-1)
-        if inf_tensor_value.device != logits.device:
-            inf_tensor_value = inf_tensor_value.to(device=logits.device)
-        logits = torch.where(logits < pivot, inf_tensor_value, logits)
+    # if top_k is not None:
+    v, _ = torch.topk(logits, top_k)
+    pivot = v.select(-1, -1).unsqueeze(-1)
+    if inf_tensor_value.device != logits.device:
+        inf_tensor_value = inf_tensor_value.to(device=logits.device)
+    logits = torch.where(logits < pivot, inf_tensor_value, logits)
 
-    probs = torch.nn.functional.softmax(logits, dim=-1)
+    probs = torch.nn.functional.softmax(logits.unsqueeze(0), dim=1)
     return probs
 
 
@@ -73,7 +76,7 @@ def multinomial_sample_one_no_sync(
     probs_sort
 ):  # Does multinomial sampling without a cuda synchronization
     q = torch.randn_like(probs_sort)
-    return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
+    return torch.argmax(probs_sort / q, dim=1, keepdim=True).to(dtype=torch.int)[0]
 
 
 def sample(
@@ -87,6 +90,162 @@ def sample(
     idx_next = multinomial_sample_one_no_sync(probs)
     return idx_next, probs
 
+
+# @torch.jit.script
+class T2SMLP:
+    def __init__(self, w1, b1, w2, b2):
+        self.w1 = w1
+        self.b1 = b1
+        self.w2 = w2
+        self.b2 = b2
+
+        w1.requires_grad = False
+        b1.requires_grad = False
+        w2.requires_grad = False
+        b2.requires_grad = False
+
+    def forward(self, x):
+        x = F.relu(F.linear(x, self.w1, self.b1))
+        x = F.linear(x, self.w2, self.b2)
+        return x
+
+
+# @torch.jit.script
+class T2SBlock:
+    def __init__(
+        self,
+        num_heads,
+        hidden_dim: int,
+        mlp: T2SMLP,
+        qkv_w,
+        qkv_b,
+        out_w,
+        out_b,
+        norm_w1,
+        norm_b1,
+        norm_eps1,
+        norm_w2,
+        norm_b2,
+        norm_eps2,
+    ):
+        self.num_heads = num_heads
+        self.mlp = mlp
+        self.hidden_dim: int = hidden_dim
+        self.qkv_w = qkv_w
+        self.qkv_b = qkv_b
+        self.out_w = out_w
+        self.out_b = out_b
+        self.norm_w1 = norm_w1
+        self.norm_b1 = norm_b1
+        self.norm_eps1 = norm_eps1
+        self.norm_w2 = norm_w2
+        self.norm_b2 = norm_b2
+        self.norm_eps2 = norm_eps2
+
+        self.qkv_w.requires_grad = False
+        self.qkv_b.requires_grad = False
+        self.out_w.requires_grad = False
+        self.out_b.requires_grad = False
+        self.norm_w1.requires_grad = False
+        self.norm_b1.requires_grad = False
+        self.norm_w2.requires_grad = False
+        self.norm_b2.requires_grad = False
+
+    def process_prompt(self, x, attn_mask : torch.Tensor):
+        q, k, v = F.linear(x, self.qkv_w, self.qkv_b).chunk(3, dim=-1)
+
+        batch_size = q.shape[0]
+        q_len = q.shape[1]
+        kv_len = k.shape[1]
+
+        k_cache = k
+        v_cache = v
+
+        q = q.view(batch_size, q_len, self.num_heads, -1).transpose(1, 2)
+        k = k_cache.view(batch_size, kv_len, self.num_heads, -1).transpose(1, 2)
+        v = v_cache.view(batch_size, kv_len, self.num_heads, -1).transpose(1, 2)
+
+        attn = F.scaled_dot_product_attention(q, k, v, ~attn_mask)
+
+        attn = attn.permute(2, 0, 1, 3).reshape(batch_size, -1, self.hidden_dim)
+        attn = F.linear(attn, self.out_w, self.out_b)
+
+        x = F.layer_norm(
+            x + attn, [self.hidden_dim], self.norm_w1, self.norm_b1, self.norm_eps1
+        )
+        x = F.layer_norm(
+            x + self.mlp.forward(x),
+            [self.hidden_dim],
+            self.norm_w2,
+            self.norm_b2,
+            self.norm_eps2,
+        )
+        return x, k_cache, v_cache
+
+    def decode_next_token(self, x, k_cache, v_cache):
+        q, k, v = F.linear(x, self.qkv_w, self.qkv_b).chunk(3, dim=-1)
+
+        k_cache = torch.cat([k_cache, k], dim=1)
+        v_cache = torch.cat([v_cache, v], dim=1)
+        kv_len = k_cache.shape[1]
+
+        batch_size = q.shape[0]
+        q_len = q.shape[1]
+
+        q = q.view(batch_size, q_len, self.num_heads, -1).transpose(1, 2)
+        k = k_cache.view(batch_size, kv_len, self.num_heads, -1).transpose(1, 2)
+        v = v_cache.view(batch_size, kv_len, self.num_heads, -1).transpose(1, 2)
+
+
+        attn = F.scaled_dot_product_attention(q, k, v)
+
+        attn = attn.permute(2, 0, 1, 3).reshape(batch_size, -1, self.hidden_dim)
+        attn = F.linear(attn, self.out_w, self.out_b)
+
+        x = F.layer_norm(
+            x + attn, [self.hidden_dim], self.norm_w1, self.norm_b1, self.norm_eps1
+        )
+        x = F.layer_norm(
+            x + self.mlp.forward(x),
+            [self.hidden_dim],
+            self.norm_w2,
+            self.norm_b2,
+            self.norm_eps2,
+        )
+        return x, k_cache, v_cache
+
+
+# @torch.jit.script
+class T2STransformer:
+    def __init__(self, num_blocks : int, blocks: List[T2SBlock]):
+        self.num_blocks : int = num_blocks
+        self.blocks = blocks
+
+    def process_prompt(
+        self, x, attn_mask : torch.Tensor):
+        k_cache : List[torch.Tensor] = []
+        v_cache : List[torch.Tensor] = []
+        for i in range(self.num_blocks):
+            x, k_cache_, v_cache_ = self.blocks[i].process_prompt(x, attn_mask)
+            k_cache.append(k_cache_.unsqueeze(0))
+            v_cache.append(v_cache_.unsqueeze(0))
+        k_cache = torch.concat(k_cache, dim=0)
+        v_cache = torch.concat(v_cache, dim=0)
+        return x, k_cache, v_cache
+
+    def decode_next_token(
+        self, x, k_cache: List[torch.Tensor], v_cache: List[torch.Tensor]
+    ):
+        k_cache_new : List[torch.Tensor] = []
+        v_cache_new : List[torch.Tensor] = []
+
+        for i in range(self.num_blocks):
+            x, k, v = self.blocks[i].decode_next_token(x, k_cache[i], v_cache[i])
+            k_cache_new.append(k.unsqueeze(0))
+            v_cache_new.append(v.unsqueeze(0))
+        k_cache = torch.concat(k_cache_new, dim=0)
+        v_cache = torch.concat(v_cache_new, dim=0)
+        return x, k_cache, v_cache
 
 class OnnxEncoder(nn.Module):
     def __init__(self, ar_text_embedding, bert_proj, ar_text_position):
@@ -102,12 +261,12 @@ class OnnxEncoder(nn.Module):
 
 
 class T2SFirstStageDecoder(nn.Module):
-    def __init__(self, ar_audio_embedding, ar_audio_position, h, ar_predict_layer, loss_fct, ar_accuracy_metric,
+    def __init__(self, ar_audio_embedding, ar_audio_position, t2s_transformer:T2STransformer, ar_predict_layer, loss_fct, ar_accuracy_metric,
     top_k, early_stop_num, num_layers):
         super().__init__()
         self.ar_audio_embedding = ar_audio_embedding
         self.ar_audio_position = ar_audio_position
-        self.h = h
+        self.t2s_transformer = t2s_transformer
         self.ar_predict_layer = ar_predict_layer
         self.loss_fct = loss_fct
         self.ar_accuracy_metric = ar_accuracy_metric
@@ -118,19 +277,9 @@ class T2SFirstStageDecoder(nn.Module):
     def forward(self, x, prompt):
         y = prompt
         x_example = x[:,:,0] * 0.0
-        #N, 1, 512
-        cache = {
-            "all_stage": self.num_layers,
-            "k": None,
-            "v": None,
-            "y_emb": None,
-            "first_infer": 1,
-            "stage": 0,
-        }
 
         y_emb = self.ar_audio_embedding(y)        
 
-        cache["y_emb"] = y_emb
         y_pos = self.ar_audio_position(y_emb)
 
         xy_pos = torch.concat([x, y_pos], dim=1)
@@ -148,27 +297,37 @@ class T2SFirstStageDecoder(nn.Module):
         x_attn_mask_pad = torch.cat([x_attn_mask, torch.ones_like(x_y_pad)], dim=1)
         y_attn_mask = torch.cat([y_x_pad, y_attn_mask], dim=1)
         xy_attn_mask = torch.concat([x_attn_mask_pad, y_attn_mask], dim=0)
-        cache["k"] = torch.matmul(x_attn_mask_pad[0].float().unsqueeze(-1), torch.zeros((1, 512)).to(device=x_attn_mask_pad.device))\
-        .unsqueeze(1).repeat(self.num_layers, 1, 1, 1).to(xy_pos.dtype)
-        cache["v"] = torch.matmul(x_attn_mask_pad[0].float().unsqueeze(-1), torch.zeros((1, 512)).to(device=x_attn_mask_pad.device))\
-        .unsqueeze(1).repeat(self.num_layers, 1, 1, 1).to(xy_pos.dtype)
 
-        xy_dec = self.h(xy_pos, mask=xy_attn_mask, cache=cache)
+        xy_dec, k_cache, v_cache = self.t2s_transformer.process_prompt(xy_pos, xy_attn_mask)
+
         logits = self.ar_predict_layer(xy_dec[:, -1])
         samples = sample(logits[0], y, top_k=self.top_k, top_p=1.0, repetition_penalty=1.35)[0].unsqueeze(0)
 
         y = torch.concat([y, samples], dim=1)
 
-        return y, cache["k"], cache["v"], cache["y_emb"], x_example
+        if debug:
+            print('T2SFirstStageDecoder.forward')
+            print('x:', x.shape)
+            print('x_example:', x_example.shape)
+            print('y:', y.shape)
+            print('y_emb:', y_emb.shape)
+            print('xy_pos:', xy_pos.shape)
+            print('y_attn_mask:', y_attn_mask.shape)
+            print('xy_attn_mask:', xy_attn_mask.shape)
+            print('xy_dec:', xy_dec.shape)
+            print('logits:', logits.shape)
+            print('samples:', samples.shape)
+
+        return y, k_cache, v_cache, y_emb
 
 
 class T2SStageDecoder(nn.Module):
-    def __init__(self, ar_audio_embedding, ar_audio_position, h, ar_predict_layer, loss_fct, ar_accuracy_metric,
+    def __init__(self, ar_audio_embedding, ar_audio_position, t2s_transformer:T2STransformer, ar_predict_layer, loss_fct, ar_accuracy_metric,
     top_k, early_stop_num, num_layers):
         super().__init__()
         self.ar_audio_embedding = ar_audio_embedding
         self.ar_audio_position = ar_audio_position
-        self.h = h
+        self.t2s_transformer = t2s_transformer
         self.ar_predict_layer = ar_predict_layer
         self.loss_fct = loss_fct
         self.ar_accuracy_metric = ar_accuracy_metric
@@ -176,36 +335,30 @@ class T2SStageDecoder(nn.Module):
         self.early_stop_num = early_stop_num
         self.num_layers = num_layers
 
-    def forward(self, y, k, v, y_emb, x_example):
-        cache = {
-            "all_stage": self.num_layers,
-            "k": torch.nn.functional.pad(k, (0, 0, 0, 0, 0, 1)),
-            "v": torch.nn.functional.pad(v, (0, 0, 0, 0, 0, 1)),
-            "y_emb": y_emb,
-            "first_infer": 0,
-            "stage": 0,
-        }
-
+    def forward(self, y, k, v, y_emb):
         y_emb = torch.cat(
-            [cache["y_emb"], self.ar_audio_embedding(y[:, -1:])], 1
+            [y_emb, self.ar_audio_embedding(y[:, -1:])], 1
         )
-        cache["y_emb"] = y_emb
         y_pos = self.ar_audio_position(y_emb)
 
         xy_pos = y_pos[:, -1:]
         
-        y_example = y_pos[:,:,0] * 0.0
-
-        xy_attn_mask = torch.cat([x_example, y_example], dim=1)
-        xy_attn_mask = torch.zeros_like(xy_attn_mask, dtype=torch.bool)
-
-        xy_dec = self.h(xy_pos, mask=xy_attn_mask, cache=cache)
+        xy_dec, k_cache, v_cache = self.t2s_transformer.decode_next_token(xy_pos, k, v)
         logits = self.ar_predict_layer(xy_dec[:, -1])
         samples = sample(logits[0], y, top_k=self.top_k, top_p=1.0, repetition_penalty=1.35)[0].unsqueeze(0)
 
         y = torch.concat([y, samples], dim=1)
 
-        return y, cache["k"], cache["v"], cache["y_emb"], logits, samples
+        if debug:
+            print('T2SStageDecoder.forward')
+            print('y:', y.shape)
+            print('y_emb:', y_emb.shape)
+            print('xy_pos:', xy_pos.shape)
+            print('xy_dec:', xy_dec.shape)
+            print('logits:', logits.shape)
+            print('samples:', samples.shape)
+
+        return y, k_cache, v_cache, y_emb, logits, samples
 
 
 class Text2SemanticDecoder(nn.Module):
@@ -251,12 +404,43 @@ class Text2SemanticDecoder(nn.Module):
         self.top_k = torch.LongTensor([1])
         self.early_stop_num = torch.LongTensor([-1])
 
+        blocks = []
+
+        for i in range(self.num_layers):
+            layer = self.h.layers[i]
+            t2smlp = T2SMLP(
+                layer.linear1.weight,
+                layer.linear1.bias,
+                layer.linear2.weight,
+                layer.linear2.bias
+            )
+            # (layer.self_attn.in_proj_weight, layer.self_attn.in_proj_bias)
+            block = T2SBlock(
+                self.num_head,
+                self.model_dim,
+                t2smlp,
+                layer.self_attn.in_proj_weight,
+                layer.self_attn.in_proj_bias,
+                layer.self_attn.out_proj.weight,
+                layer.self_attn.out_proj.bias,
+                layer.norm1.weight,
+                layer.norm1.bias,
+                layer.norm1.eps,
+                layer.norm2.weight,
+                layer.norm2.bias,
+                layer.norm2.eps
+            )
+
+            blocks.append(block)
+        
+        self.t2s_transformer = T2STransformer(self.num_layers, blocks)
+
     def init_onnx(self):
         self.onnx_encoder = OnnxEncoder(self.ar_text_embedding, self.bert_proj, self.ar_text_position)
-        self.first_stage_decoder = T2SFirstStageDecoder(self.ar_audio_embedding, self.ar_audio_position, self.h, 
+        self.first_stage_decoder = T2SFirstStageDecoder(self.ar_audio_embedding, self.ar_audio_position, self.t2s_transformer, 
             self.ar_predict_layer, self.loss_fct, self.ar_accuracy_metric, self.top_k, self.early_stop_num,
             self.num_layers)
-        self.stage_decoder = T2SStageDecoder(self.ar_audio_embedding, self.ar_audio_position, self.h, 
+        self.stage_decoder = T2SStageDecoder(self.ar_audio_embedding, self.ar_audio_position, self.t2s_transformer, 
             self.ar_predict_layer, self.loss_fct, self.ar_accuracy_metric, self.top_k, self.early_stop_num,
             self.num_layers)
 
@@ -265,11 +449,19 @@ class Text2SemanticDecoder(nn.Module):
         prefix_len = prompts.shape[1]
 
         x = self.onnx_encoder(x, bert_feature)
-        y, k, v, y_emb, x_example = self.first_stage_decoder(x, prompts)
+        # import numpy as np
+        # np.savetxt('TEMP/onnx-x.txt', x.cpu().numpy().squeeze())
+        # np.savetxt('TEMP/onnx-prompts.txt', prompts.cpu().numpy().squeeze())
+
+        y, k, v, y_emb = self.first_stage_decoder(x, prompts)
 
         stop = False
-        for idx in range(1, 1500):
-            enco = self.stage_decoder(y, k, v, y_emb, x_example)
+        times = []
+        import time
+        for idx in range(1500):
+            start = time.time()
+            enco = self.stage_decoder(y, k, v, y_emb)
+            times.append(time.time() - start)
             y, k, v, y_emb, logits, samples = enco
             if early_stop_num != -1 and (y.shape[1] - prefix_len) > early_stop_num:
                 stop = True
@@ -277,14 +469,15 @@ class Text2SemanticDecoder(nn.Module):
                 stop = True
             if stop:
                 break
+        print(times)
         y[0, -1] = 0
         return y, idx
 
     def infer_panel(
         self,
-        x,  #####全部文本token
+        x,  #####鍏ㄩ儴鏂囨湰token
         x_lens,
-        prompts,  ####参考音频token
+        prompts,  ####鍙傝�冮煶棰憈oken
         bert_feature,
         top_k: int = -100,
         top_p: int = 100,

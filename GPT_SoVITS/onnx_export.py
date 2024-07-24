@@ -113,12 +113,12 @@ class T2SModel(nn.Module):
         prefix_len = prompts.shape[1]
 
         #[1,N,512] [1,N]
-        y, k, v, y_emb, x_example = self.first_stage_decoder(x, prompts)
+        y, k, v, y_emb = self.first_stage_decoder(x, prompts)
 
         stop = False
         for idx in range(1, 1500):
             #[1, N] [N_layer, N, 1, 512] [N_layer, N, 1, 512] [1, N, 512] [1] [1, N, 512] [1, N]
-            enco = self.stage_decoder(y, k, v, y_emb, x_example)
+            enco = self.stage_decoder(y, k, v, y_emb)
             y, k, v, y_emb, logits, samples = enco
             if early_stop_num != -1 and (y.shape[1] - prefix_len) > early_stop_num:
                 stop = True
@@ -143,7 +143,7 @@ class T2SModel(nn.Module):
             return
 
         all_phoneme_ids, bert, prompts = self.onnx_encoder(ref_seq, text_seq, ref_bert, text_bert, ssl_content)
-        print(prompts)
+        # print(prompts)
 
         torch.onnx.export(
             self.onnx_encoder.encoder,
@@ -164,7 +164,7 @@ class T2SModel(nn.Module):
             (x, prompts),
             f"onnx/{project_name}/{project_name}_t2s_fsdec.onnx",
             input_names=["x", "prompts"],
-            output_names=["y", "k", "v", "y_emb", "x_example"],
+            output_names=["y", "k", "v", "y_emb"],
             dynamic_axes={
                 "x": {1 : "x_length"},
                 "prompts": {1 : "prompts_length"},
@@ -172,20 +172,19 @@ class T2SModel(nn.Module):
             verbose=False,
             opset_version=16
         )
-        y, k, v, y_emb, x_example = self.first_stage_decoder(x, prompts)
+        y, k, v, y_emb = self.first_stage_decoder(x, prompts)
 
         torch.onnx.export(
             self.stage_decoder,
-            (y, k, v, y_emb, x_example),
+            (y, k, v, y_emb),
             f"onnx/{project_name}/{project_name}_t2s_sdec.onnx",
-            input_names=["iy", "ik", "iv", "iy_emb", "ix_example"],
+            input_names=["iy", "ik", "iv", "iy_emb"],
             output_names=["y", "k", "v", "y_emb", "logits", "samples"],
             dynamic_axes={
                 "iy": {1 : "iy_length"},
-                "ik": {1 : "ik_length"},
-                "iv": {1 : "iv_length"},
+                "ik": {2 : "ik_length"},
+                "iv": {2 : "iv_length"},
                 "iy_emb": {1 : "iy_emb_length"},
-                "ix_example": {1 : "ix_example_length"},
             },
             verbose=False,
             opset_version=16
@@ -241,7 +240,8 @@ class GptSoVits(nn.Module):
         return audio
 
     def export(self, ref_seq, text_seq, ref_bert, text_bert, ref_audio, ssl_content, project_name):
-        self.t2s.export(ref_seq, text_seq, ref_bert, text_bert, ssl_content, project_name)
+        with torch.no_grad():
+            self.t2s.export(ref_seq, text_seq, ref_bert, text_bert, ssl_content, project_name)
         # pred_semantic = self.t2s(ref_seq, text_seq, ref_bert, text_bert, ssl_content)
         # torch.onnx.export(
         #     self.vits,
@@ -330,6 +330,8 @@ if __name__ == "__main__":
     gpt_path = "../GPT_weights/test-e15.ckpt"
     vits_path = "../SoVITS_weights/test_e8_s64.pth"
     exp_path = "test"
-    export(vits_path, gpt_path, exp_path)
+    with torch.no_grad():
+        export(vits_path, gpt_path, exp_path)
 
     # soundfile.write("out.wav", a, vits.hps.data.sampling_rate
+    
