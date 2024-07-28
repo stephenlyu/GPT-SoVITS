@@ -144,9 +144,6 @@ class T2SModelOnnxRT:
             print(all_phoneme_ids.shape, prompts.shape, bert_feature.shape)
         x = self.encode(all_phoneme_ids, bert_feature)
         prefix_len = prompts.shape[1]
-        
-        np.savetxt('TEMP/onnx-ort-x.txt', x.numpy().squeeze())
-        np.savetxt('TEMP/onnx-ort-prompts.txt', prompts.cpu().numpy().squeeze())
 
         y, k, v, y_emb = self.first_stage_decode(x, prompts)
 
@@ -172,32 +169,16 @@ class T2SModelOnnxRT:
         return y, idx        
 
 if __name__ == '__main__':
-    from feature_extractor import cnhubert
-    import torchaudio
-    from text import cleaned_text_to_sequence
-    cnhubert_base_path = "pretrained_models/chinese-hubert-base"
-    cnhubert.cnhubert_base_path=cnhubert_base_path
-    ssl_model = cnhubert.get_model().half().to('cuda')
-    
-    ref_seq = torch.LongTensor([cleaned_text_to_sequence(["n", "i2", "h", "ao3", ",", "w", "o3", "sh", "i4", "b", "ai2", "y", "e4"])]).to('cuda')
-    text_seq = torch.LongTensor([cleaned_text_to_sequence(["w", "o3", "sh", "i4", "b", "ai2", "y", "e4", "w", "o3", "sh", "i4", "b", "ai2", "y", "e4", "w", "o3", "sh", "i4", "b", "ai2", "y", "e4"])]).to('cuda')
-    ref_bert = torch.randn((ref_seq.shape[1], 1024)).half().to('cuda')
-    text_bert = torch.randn((text_seq.shape[1], 1024)).half().to('cuda')
+    onnx = T2SModelOnnxRT('onnx/test', is_half=False)
 
-    onnx = T2SModelOnnxRT('onnx_f16/test')
+    all_phoneme_ids = np.load('test_data/onnx-x.npy')
+    prompts = np.load('test_data/onnx-prompts.npy')
+    bert = np.load('test_data/onnx-bert.npy')
 
-    prompts = torch.tensor([[752, 366, 738, 184, 247, 247, 278, 247, 247, 752, 247, 821, 247, 247,
-         807, 278, 127, 366, 247, 184, 366, 247,  37, 247, 366, 916, 738, 366,
-         278,  37, 247, 184, 916, 127,  37, 738, 247, 184, 366, 247, 184, 916,
-         477, 278, 916, 184, 127, 247, 366, 127, 184, 738,   2, 247, 366,  22,
-         366, 738, 916, 243, 127, 477, 916, 278, 278, 738, 247, 916, 127,  37,
-         807, 127, 738, 802, 278, 127, 278, 278, 247, 247, 184, 916, 916, 916,
-         184, 184, 366, 278, 738, 127, 247, 247, 477, 237, 273, 916, 127, 127,
-         184, 247, 366, 247, 738, 366, 243, 366, 247, 184, 738, 184, 247, 366,
-         738, 738, 127, 366, 366, 247, 366, 817, 406,  59, 807, 184]], dtype=torch.int64).to('cuda')
-
-    bert = torch.cat([ref_bert.transpose(0, 1), text_bert.transpose(0, 1)], 1)
-    all_phoneme_ids = torch.cat([ref_seq, text_seq], 1)
-    bert = bert.unsqueeze(0)
-
-    onnx.infer_panel(all_phoneme_ids, prompts, bert)
+    start = time.time()
+    y, idx = onnx.infer_panel(torch.from_numpy(all_phoneme_ids).to('cuda'), 
+        torch.from_numpy(prompts).to('cuda'),
+        torch.from_numpy(bert).to('cuda'))
+    print('time cost:', time.time() - start)
+    print(idx)
+    print(y)

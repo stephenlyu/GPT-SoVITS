@@ -255,6 +255,9 @@ class OnnxEncoder(nn.Module):
         self.ar_text_position = ar_text_position
     
     def forward(self, x, bert_feature):
+        if debug:
+            print('all_phoneme_ids:', x.shape)
+            print('bert:', bert_feature.shape)
         x = self.ar_text_embedding(x)
         x = x + self.bert_proj(bert_feature.transpose(1, 2))
         return self.ar_text_position(x)
@@ -262,7 +265,7 @@ class OnnxEncoder(nn.Module):
 
 class T2SFirstStageDecoder(nn.Module):
     def __init__(self, ar_audio_embedding, ar_audio_position, t2s_transformer:T2STransformer, ar_predict_layer, loss_fct, ar_accuracy_metric,
-    top_k, early_stop_num, num_layers):
+    top_k, num_layers):
         super().__init__()
         self.ar_audio_embedding = ar_audio_embedding
         self.ar_audio_position = ar_audio_position
@@ -271,7 +274,6 @@ class T2SFirstStageDecoder(nn.Module):
         self.loss_fct = loss_fct
         self.ar_accuracy_metric = ar_accuracy_metric
         self.top_k = top_k
-        self.early_stop_num = early_stop_num
         self.num_layers = num_layers
     
     def forward(self, x, prompt):
@@ -323,7 +325,7 @@ class T2SFirstStageDecoder(nn.Module):
 
 class T2SStageDecoder(nn.Module):
     def __init__(self, ar_audio_embedding, ar_audio_position, t2s_transformer:T2STransformer, ar_predict_layer, loss_fct, ar_accuracy_metric,
-    top_k, early_stop_num, num_layers):
+    top_k, num_layers):
         super().__init__()
         self.ar_audio_embedding = ar_audio_embedding
         self.ar_audio_position = ar_audio_position
@@ -332,7 +334,6 @@ class T2SStageDecoder(nn.Module):
         self.loss_fct = loss_fct
         self.ar_accuracy_metric = ar_accuracy_metric
         self.top_k = top_k
-        self.early_stop_num = early_stop_num
         self.num_layers = num_layers
 
     def forward(self, y, k, v, y_emb):
@@ -352,6 +353,8 @@ class T2SStageDecoder(nn.Module):
         if debug:
             print('T2SStageDecoder.forward')
             print('y:', y.shape)
+            print('k:', k.shape)
+            print('v:', v.shape)
             print('y_emb:', y_emb.shape)
             print('xy_pos:', xy_pos.shape)
             print('xy_dec:', xy_dec.shape)
@@ -401,7 +404,7 @@ class Text2SemanticDecoder(nn.Module):
             multidim_average="global",
             ignore_index=self.EOS,
         )
-        self.top_k = torch.LongTensor([1])
+        self.top_k = torch.LongTensor([5])
         self.early_stop_num = torch.LongTensor([-1])
 
         blocks = []
@@ -438,20 +441,24 @@ class Text2SemanticDecoder(nn.Module):
     def init_onnx(self):
         self.onnx_encoder = OnnxEncoder(self.ar_text_embedding, self.bert_proj, self.ar_text_position)
         self.first_stage_decoder = T2SFirstStageDecoder(self.ar_audio_embedding, self.ar_audio_position, self.t2s_transformer, 
-            self.ar_predict_layer, self.loss_fct, self.ar_accuracy_metric, self.top_k, self.early_stop_num,
+            self.ar_predict_layer, self.loss_fct, self.ar_accuracy_metric, self.top_k, 
             self.num_layers)
         self.stage_decoder = T2SStageDecoder(self.ar_audio_embedding, self.ar_audio_position, self.t2s_transformer, 
-            self.ar_predict_layer, self.loss_fct, self.ar_accuracy_metric, self.top_k, self.early_stop_num,
+            self.ar_predict_layer, self.loss_fct, self.ar_accuracy_metric, self.top_k, 
             self.num_layers)
 
     def forward(self, x, prompts, bert_feature):
         early_stop_num = self.early_stop_num
         prefix_len = prompts.shape[1]
+        if debug:
+            print('early_stop_num:', self.early_stop_num)
+            print('top_k:', self.top_k)
 
+            import numpy as np
+            np.save('TEMP/onnx-x.npy', x.cpu().numpy())
+            np.save('TEMP/onnx-prompts.npy', prompts.cpu().numpy())
+            np.save('TEMP/onnx-bert.npy', bert_feature.cpu().numpy())
         x = self.onnx_encoder(x, bert_feature)
-        # import numpy as np
-        # np.savetxt('TEMP/onnx-x.txt', x.cpu().numpy().squeeze())
-        # np.savetxt('TEMP/onnx-prompts.txt', prompts.cpu().numpy().squeeze())
 
         y, k, v, y_emb = self.first_stage_decoder(x, prompts)
 
